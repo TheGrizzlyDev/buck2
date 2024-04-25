@@ -951,9 +951,10 @@ where
     let inlined_digests = request.inlined_digests.unwrap_or_default();
     let file_digests = request.file_digests.unwrap_or_default();
 
-    let mut curr_size = 0;
+    let mut curr_size: usize = 0;
     let mut requests = vec![];
     let mut curr_digests = vec![];
+    let estimate_digest_size = |hash: &String, size_bytes: i64| { size_bytes as usize + std::mem::size_of_val(&size_bytes) + hash.as_bytes().len() };
     for digest in file_digests
         .iter()
         .map(|req| &req.named_digest.digest)
@@ -961,20 +962,23 @@ where
         .map(|d| tdigest_to(d.clone()))
         .filter(|d| d.size_bytes > 0)
     {
-        if digest.size_bytes as usize >= max_msg_size {
+        let digest_size_estimate = estimate_digest_size(&digest.hash, digest.size_bytes);
+        if digest_size_estimate as usize >= max_msg_size {
             // digest is too big to download in a BatchReadBlobsRequest
             // need to use the bytstream api
             continue;
         }
-        curr_size += digest.size_bytes;
-        if curr_size >= max_msg_size as i64 {
+        let mut total_size = curr_size + digest_size_estimate;
+        if total_size >= max_msg_size {
             let read_blob_req = BatchReadBlobsRequest {
                 instance_name: instance_name.as_str().to_owned(),
                 digests: std::mem::take(&mut curr_digests),
                 acceptable_compressors: vec![compressor::Value::Identity as i32],
             };
+            total_size = digest_size_estimate;
             requests.push(read_blob_req);
         }
+        curr_size = total_size;
         curr_digests.push(digest.clone());
     }
 
@@ -1012,7 +1016,7 @@ where
 
     let mut inlined_blobs = vec![];
     for digest in inlined_digests {
-        let data = if digest.size_in_bytes as usize >= max_msg_size {
+        let data = if estimate_digest_size(&digest.hash, digest.size_in_bytes) >= max_msg_size {
             let mut accum = vec![];
             let mut responses = bystream_fut(digest.clone()).await?;
             while let Some(resp) = responses.next().await {
@@ -1574,7 +1578,7 @@ mod tests {
         download_impl(
             &InstanceName(None),
             req,
-            10, // kept small to simulate a large file download
+            15, // kept small to simulate a large file download
             |req| {
                 let res = res.clone();
                 let digest1 = digest1.clone();
@@ -1615,6 +1619,55 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_total_batch_size_over_limit() -> anyhow::Result<()> {
+        const MAX_SIZE_IN_BYTES: usize = 15;
+        let digest1 = &TDigest{
+            hash: "aa".to_owned(),
+            size_in_bytes: 3,
+            ..Default::default()
+        };
+        let digest2 = &TDigest {
+            hash: "bb".to_owned(),
+            size_in_bytes: 3,
+            ..Default::default()
+        };
+        let digest3 = &TDigest {
+            hash: "cc".to_owned(),
+            size_in_bytes: 15, // does not fit a batch request
+            ..Default::default()
+        };
+
+        let big_blob_read_response = ReadResponse{ data: (0..(digest3.size_in_bytes)).map(|_| 0 as u8).collect() };
+
+        let req = DownloadRequest { 
+            inlined_digests: Some(vec![digest1.clone(), digest2.clone(), digest3.clone()]),
+            ..Default::default()
+        };
+
+        let _ = download_impl(
+            &InstanceName(None), 
+            req, 
+            MAX_SIZE_IN_BYTES, 
+            |batch_req| {
+                let total_download_size: usize = batch_req.digests.iter().map(|digest| { digest.size_bytes as usize }).sum();
+                assert!(total_download_size <= MAX_SIZE_IN_BYTES, "total download size exceeds the max message capacity (message_size={}, max={})", total_download_size, MAX_SIZE_IN_BYTES);
+                let responses = batch_req.digests.map(|d| {
+                    return batch_read_blobs_response::Response { 
+                        digest: Some(d.clone()), 
+                        data: (0..(d.size_bytes)).map(|_| 0 as u8).collect(),
+                        ..Default::default()
+                    }
+                });
+                async { anyhow::Ok(BatchReadBlobsResponse { responses: responses })}
+            }, 
+            |_bs_read_req| {
+                async { anyhow::Ok(Box::pin(futures::stream::iter(vec![Ok(big_blob_read_response.clone())]))) }
+            }).await?;
+
+        anyhow::Ok(())
     }
 
     #[tokio::test]
@@ -1684,6 +1737,7 @@ mod tests {
         Ok(())
     }
 
+
     #[tokio::test]
     async fn test_download_large_inlined() -> anyhow::Result<()> {
         let digest1 = &TDigest {
@@ -1728,7 +1782,7 @@ mod tests {
         let res = download_impl(
             &InstanceName(None),
             req,
-            10, // intentionally small value to keep data in the test blobs small
+            15, // intentionally small value to keep data in the test blobs small
             |req| {
                 let res = res.clone();
                 let digest1 = digest1.clone();
