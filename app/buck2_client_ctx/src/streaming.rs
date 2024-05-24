@@ -73,6 +73,9 @@ fn default_subscribers<'a, T: StreamingCommand>(
     if let Some(build_graph_stats) = try_get_build_graph_stats(cmd, ctx)? {
         subscribers.push(build_graph_stats)
     }
+    if let Some(bep_writer) = try_get_bep_writer(ctx, cmd)? {
+        subscribers.push(bep_writer)
+    }
     let recorder = try_get_invocation_recorder(
         ctx,
         cmd.event_log_opts(),
@@ -84,6 +87,18 @@ fn default_subscribers<'a, T: StreamingCommand>(
 
     subscribers.extend(cmd.extra_subscribers());
     Ok(EventSubscribers::new(subscribers))
+}
+
+struct BepWriter {}
+
+impl EventSubscriber for BepWriter {
+    fn handle_daemon_started(&mut self, _reason: buck2_data::DaemonWasStartedReason) {
+        panic!("Daemon started!");
+    }
+}
+
+fn try_get_bep_writer<T: StreamingCommand>(_ctx: &ClientCommandContext<'_>, _cmd: &T) -> anyhow::Result<Option<Box<dyn EventSubscriber>>> {
+    Ok(Some(Box::new(BepWriter{})))
 }
 
 /// Trait to generalize the behavior of executable buck2 commands that rely on a server.
